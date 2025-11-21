@@ -15,7 +15,7 @@ function AgentDashboard() {
 
   const fetchLatestConfigs = async () => {
     try {
-      const response = await fetch('${API_URL}/eval/runs/compare?eval_set_id=a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+      const response = await fetch(`${API_URL}/eval/runs/compare?eval_set_id=a1b2c3d4-e5f6-7890-abcd-ef1234567890`);
       if (response.ok) {
         const data = await response.json();
         setConfigs(data.runs || []);
@@ -35,7 +35,7 @@ function AgentDashboard() {
         throw new Error('No eval runs found. Run an evaluation first.');
       }
   
-      const response = await fetch('${API_URL}/agent/analyze', {
+      const response = await fetch(`${API_URL}/agent/analyze`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -63,7 +63,7 @@ function AgentDashboard() {
     setError(null);
     
     try {
-      const response = await fetch('h${API_URL}/agent/auto-tune', {
+      const response = await fetch(`${API_URL}/agent/auto-tune`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
