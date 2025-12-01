@@ -36,7 +36,7 @@ function AgentDashboard() {
   const [liveLatency, setLiveLatency] = useState(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState(null);
-
+  const bestRunForAnalysis = configs.length > 0 ? configs[0] : null;
   // Helper: Human readable origin label for eval runs/configs
   const getOriginLabel = (origin) => {
     if (origin === 'agent_suggested') return 'Agent suggested config';
@@ -44,10 +44,15 @@ function AgentDashboard() {
     return 'Manual baseline config';
   };
 
-  // Fetch latest configs on load
+  // Fetch data when tabs change
   useEffect(() => {
-    fetchLatestConfigs();
-  }, []);
+    if (activeTab === 'evalViewer') {
+      fetchEvalRuns();
+    }
+    if (activeTab === 'configs' || activeTab === 'agentAnalysis' || activeTab === 'autoTune') {
+      fetchLatestConfigs();
+    }
+  }, [activeTab]);
 
   const fetchLatestConfigs = async () => {
     try {
@@ -68,8 +73,10 @@ function AgentDashboard() {
     setError(null);
 
     try {
-      const latestRun = configs[0];
-      if (!latestRun) {
+        const chosenRun =
+        configs.find((r) => r.eval_run_id === selectedRunId) || configs[0];
+
+      if (!chosenRun) {
         throw new Error('No eval runs found. Run an evaluation first.');
       }
 
@@ -79,7 +86,7 @@ function AgentDashboard() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          eval_run_id: latestRun.eval_run_id,
+          eval_run_id: chosenRun.eval_run_id,
         }),
       });
 
@@ -196,14 +203,44 @@ function AgentDashboard() {
       setEvalLoading(true);
       setEvalError(null);
 
-      const response = await fetch(`${API_URL}/eval/runs/compare?eval_set_id=${EVAL_SET_ID}`);
+      const response = await fetch(
+        `${API_URL}/eval/runs/compare?eval_set_id=${EVAL_SET_ID}`
+      );
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`Failed to load eval runs: ${response.status} ${text}`);
       }
 
       const data = await response.json();
-      const runs = data.runs || [];
+      let runs = data.runs || [];
+
+      if (runs.length > 0) {
+        // Assign stable serial numbers based on creation time
+        const byCreatedAsc = [...runs].sort(
+          (a, b) => new Date(a.created_at) - new Date(b.created_at)
+        );
+        const idToSerial = new Map();
+        byCreatedAsc.forEach((run, idx) => {
+          const serial = idx + 1;
+          idToSerial.set(run.eval_run_id, serial);
+        });
+
+        runs = runs.map((run) => {
+          const serialNumber = idToSerial.get(run.eval_run_id);
+          return {
+            ...run,
+            serialNumber,
+            serialLabel:
+              typeof serialNumber === 'number'
+                ? `#${String(serialNumber).padStart(4, '0')}`
+                : null,
+          };
+        });
+
+        // Show newest run at the top of the list
+        runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      }
+
       setEvalRuns(runs);
 
       if (runs.length > 0) {
@@ -240,6 +277,47 @@ function AgentDashboard() {
     } catch (err) {
       console.error('Error fetching eval run details:', err);
       setEvalError(err.message || 'Failed to load eval run details');
+    } finally {
+      setEvalLoading(false);
+    }
+  };
+
+  const createEvalRunForConfig = async (pipelineConfigId) => {
+    if (!pipelineConfigId) {
+      setEvalError('No pipeline config id available for this run.');
+      return;
+    }
+
+    try {
+      setEvalLoading(true);
+      setEvalError(null);
+
+      const response = await fetch(`${API_URL}/eval/run`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          eval_set_id: EVAL_SET_ID,
+          pipeline_config_id: pipelineConfigId,
+        }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Eval run failed: ${response.status} ${text}`);
+      }
+
+      const data = await response.json();
+
+      // Refresh the eval runs list and details
+      await fetchEvalRuns();
+      if (data.eval_run_id) {
+        await fetchRunDetails(data.eval_run_id);
+      }
+    } catch (err) {
+      console.error('Error creating eval run:', err);
+      setEvalError(err.message || 'Failed to create eval run');
     } finally {
       setEvalLoading(false);
     }
@@ -782,6 +860,29 @@ function AgentDashboard() {
             selected run on the right.
           </p>
 
+          {/* NEW CONTEXT BLOCK */}
+          <div
+            style={{
+              marginBottom: '16px',
+              padding: '12px 14px',
+              backgroundColor: 'white',
+              borderRadius: '8px',
+              border: '1px solid #e2e8f0',
+              fontSize: '13px',
+              color: '#4a5568',
+            }}
+          >
+            <strong style={{ color: '#2d3748', display: 'block', marginBottom: '6px' }}>
+              How eval runs work
+            </strong>
+            <ol style={{ margin: 0, paddingLeft: '18px' }}>
+              <li>Pick one pipeline config and one eval set.</li>
+              <li>For each question in the eval set, the system runs the RAG pipeline and retrieves chunks.</li>
+              <li>The model generates an answer based only on those chunks.</li>
+              <li>The same model judges the answer for relevance, faithfulness, and completeness.</li>
+              <li>Scores are saved per question, and averages are stored on the eval run.</li>
+            </ol>
+          </div>
           <div
             style={{
               display: 'grid',
@@ -850,6 +951,7 @@ function AgentDashboard() {
                         onClick={() => {
                           setSelectedRunId(run.eval_run_id);
                           setSelectedRunSummary(run);
+                          setEvalError(null);
                           fetchRunDetails(run.eval_run_id);
                         }}
                         style={{
@@ -875,7 +977,7 @@ function AgentDashboard() {
                           }}
                         >
                           <span style={{ color: '#2d3748', fontWeight: 600 }}>
-                            {run.config_name || 'Config'}
+                            {run.serialLabel || run.config_name || run.pipeline_config_name || 'Config'}
                           </span>
                           <span style={{ color: '#667eea', fontWeight: 600 }}>
                             {typeof run.avg_overall === 'number'
@@ -947,7 +1049,7 @@ function AgentDashboard() {
                         color: '#2d3748',
                       }}
                     >
-                      {runDetails.pipeline_config_name}
+                      {selectedRunSummary?.serialLabel || selectedRunSummary?.config_name || selectedRunSummary?.pipeline_config_name || runDetails.pipeline_config_name}
                     </h3>
                     <p
                       style={{
@@ -956,12 +1058,13 @@ function AgentDashboard() {
                         color: '#718096',
                       }}
                     >
-                      Eval set: {runDetails.eval_set_name} 
-                      · Status: {runDetails.status}
+                      Config: {selectedRunSummary?.config_name || selectedRunSummary?.pipeline_config_name || runDetails.pipeline_config_name} · Eval set: {runDetails.eval_set_name} · Status:{' '}
+                      {runDetails.status}
                       {selectedRunSummary && selectedRunSummary.origin && (
                         <> · Origin: {getOriginLabel(selectedRunSummary.origin)}</>
                       )}
                     </p>
+                    {/* Button to run new eval with this config removed */}
                   </div>
 
                   {/* Summary metrics */}
@@ -1262,304 +1365,720 @@ function AgentDashboard() {
       )}
 
       {activeTab === 'agentAnalysis' && (
-        <div>
-          {/* Run Analysis button */}
-          <div
+        <div
+          style={{
+            padding: '20px',
+            backgroundColor: '#f7fafc',
+            borderRadius: '12px',
+            border: '1px solid #e2e8f0',
+            marginBottom: '30px',
+          }}
+        >
+          <h2
             style={{
-              display: 'flex',
-              justifyContent: 'center',
-              marginBottom: '24px',
+              marginTop: 0,
+              marginBottom: '10px',
+              fontSize: '20px',
+              color: '#2d3748',
             }}
           >
-            <button
-              onClick={runAnalysis}
-              disabled={loading || configs.length === 0}
+            Agent Analysis
+          </h2>
+          <p style={{ margin: '0 0 14px', color: '#4a5568', fontSize: '14px' }}>
+            This agent reads eval results for a single pipeline configuration, summarizes how it is
+            performing, and suggests what to change next.
+          </p>
+
+                    {/* Config selector for analysis */}
+          <div
+            style={{
+              marginBottom: '16px',
+              padding: '8px 10px',
+              backgroundColor: 'white',
+              borderRadius: '8px',
+              border: '1px solid #e2e8f0',
+              fontSize: '13px',
+              color: '#4a5568',
+            }}
+          >
+            <label
               style={{
-                padding: '12px 24px',
-                fontSize: '16px',
-                backgroundColor: '#667eea',
-                color: 'white',
-                border: 'none',
-                borderRadius: '8px',
-                cursor: loading ? 'not-allowed' : 'pointer',
+                display: 'block',
+                marginBottom: '6px',
+                fontSize: '13px',
+                color: '#2d3748',
+                fontWeight: 600,
               }}
             >
-              {loading ? '🧠 Analyzing...' : '🧠 Run Analysis'}
-            </button>
+              Select config to analyze
+            </label>
+            <select
+              value={selectedRunId || (configs[0]?.eval_run_id ?? '')}
+              onChange={(e) => {
+                const run = configs.find((r) => r.eval_run_id === e.target.value);
+                if (run) {
+                  setSelectedRunId(run.eval_run_id);
+                  setAnalysis(null);
+                }
+              }}
+              style={{
+                width: '100%',
+                padding: '6px 10px',
+                borderRadius: '6px',
+                border: '1px solid #cbd5e0',
+                fontSize: '14px',
+                backgroundColor: 'white',
+              }}
+            >
+              {configs.map((run) => (
+                <option key={run.eval_run_id} value={run.eval_run_id}>
+                  {(run.serialLabel || run.config_name || 'Config')}, score{' '}
+                  {typeof run.avg_overall === 'number'
+                    ? run.avg_overall.toFixed(2)
+                    : 'N/A'}
+                </option>
+              ))}
+            </select>
           </div>
 
-          {/* Analysis content */}
-          {analysis ? (
+          {/* Context explainer */}
+          <div
+            style={{
+              marginBottom: '16px',
+              padding: '12px 14px',
+              backgroundColor: 'white',
+              borderRadius: '8px',
+              border: '1px solid #e2e8f0',
+              fontSize: '13px',
+              color: '#4a5568',
+            }}
+          >
+            <strong style={{ color: '#2d3748', display: 'block', marginBottom: '6px' }}>
+              What this agent does
+            </strong>
+            <ol style={{ margin: 0, paddingLeft: '18px' }}>
+              <li>Loads one completed eval run and its scores.</li>
+              <li>Looks at strengths and weaknesses across all questions.</li>
+              <li>Flags documentation gaps where questions have weak coverage.</li>
+              <li>Returns concrete recommendations and a narrative explanation.</li>
+            </ol>
+          </div>
+
+          {/* Config selection and action */}
+          <div
+            style={{
+              marginBottom: '18px',
+              padding: '12px 14px',
+              backgroundColor: 'white',
+              borderRadius: '8px',
+              border: '1px solid #e2e8f0',
+              fontSize: '13px',
+              color: '#4a5568',
+            }}
+          >
             <div
               style={{
-                padding: '30px',
-                backgroundColor: '#f7fafc',
-                borderRadius: '12px',
-                marginBottom: '30px',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'flex-start',
+                gap: '12px',
+                marginBottom: '8px',
               }}
             >
-              <h2
-                style={{
-                  marginTop: 0,
-                  color: '#2d3748',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '10px',
-                }}
-              >
-                🧠 Claude&apos;s Analysis
-              </h2>
-
-              <div
-                style={{
-                  background: 'white',
-                  padding: '20px',
-                  borderRadius: '8px',
-                  marginBottom: '20px',
-                }}
-              >
-                <h3 style={{ color: '#667eea', marginTop: 0 }}>Best Config</h3>
-                <p style={{ margin: 0, color: '#4a5568' }}>
-                  {analysis.best_config_name || 'N/A'}
-                </p>
+              <div>
+                <strong style={{ color: '#2d3748', display: 'block', marginBottom: '4px' }}>
+                  Config being analyzed
+                </strong>
+                {bestRunForAnalysis ? (
+                  <>
+                    <div style={{ fontSize: '13px', color: '#2d3748', marginBottom: '2px' }}>
+                      {bestRunForAnalysis.config_name || 'Unnamed config'}
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#718096' }}>
+                      Overall score:{' '}
+                      {typeof bestRunForAnalysis.avg_overall === 'number'
+                        ? bestRunForAnalysis.avg_overall.toFixed(2)
+                        : 'N/A'}{' '}
+                      · Origin: {getOriginLabel(bestRunForAnalysis.origin)}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ fontSize: '13px', color: '#718096' }}>
+                    No completed eval runs found yet. Go to the Eval Runs tab, run an evaluation,
+                    then return here.
+                  </div>
+                )}
               </div>
 
-              {analysis.strengths && analysis.strengths.length > 0 && (
-                <div
+              <div>
+                <button
+                  type="button"
+                  onClick={runAnalysis}
+                  disabled={loading || !bestRunForAnalysis}
                   style={{
-                    background: 'white',
-                    padding: '20px',
+                    padding: '8px 12px',
+                    fontSize: '13px',
                     borderRadius: '8px',
-                    marginBottom: '20px',
+                    border: '1px solid #667eea',
+                    backgroundColor:
+                      loading || !bestRunForAnalysis ? '#e2e8f0' : '#667eea',
+                    color: loading || !bestRunForAnalysis ? '#4a5568' : 'white',
+                    cursor:
+                      loading || !bestRunForAnalysis ? 'not-allowed' : 'pointer',
+                    whiteSpace: 'nowrap',
                   }}
                 >
-                  <h3 style={{ color: '#48bb78', marginTop: 0 }}>✅ Strengths</h3>
-                  <ul
-                    style={{
-                      margin: 0,
-                      paddingLeft: '20px',
-                      color: '#4a5568',
-                    }}
-                  >
-                    {analysis.strengths.map((strength, idx) => (
-                      <li key={idx} style={{ marginBottom: '8px' }}>
-                        {strength}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              {analysis.weaknesses && analysis.weaknesses.length > 0 && (
-                <div
-                  style={{
-                    background: 'white',
-                    padding: '20px',
-                    borderRadius: '8px',
-                    marginBottom: '20px',
-                  }}
-                >
-                  <h3 style={{ color: '#f56565', marginTop: 0 }}>⚠️ Weaknesses</h3>
-                  <ul
-                    style={{
-                      margin: 0,
-                      paddingLeft: '20px',
-                      color: '#4a5568',
-                    }}
-                  >
-                    {analysis.weaknesses.map((weakness, idx) => (
-                      <li key={idx} style={{ marginBottom: '8px' }}>
-                        {weakness}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              {analysis.recommendations && analysis.recommendations.length > 0 && (
-                <div
-                  style={{
-                    background: 'white',
-                    padding: '20px',
-                    borderRadius: '8px',
-                  }}
-                >
-                  <h3 style={{ color: '#667eea', marginTop: 0 }}>💡 Recommendations</h3>
-                  <ul
-                    style={{
-                      margin: 0,
-                      paddingLeft: '20px',
-                      color: '#4a5568',
-                    }}
-                  >
-                    {analysis.recommendations.map((rec, idx) => (
-                      <li key={idx} style={{ marginBottom: '8px' }}>
-                        {rec}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+                  {loading ? 'Analyzing...' : 'Run analysis on this config'}
+                </button>
+              </div>
             </div>
-          ) : (
-            <div
-              style={{
-                padding: '20px',
-                backgroundColor: '#f7fafc',
-                borderRadius: '12px',
-                border: '1px solid #e2e8f0',
-              }}
-            >
-              <p style={{ margin: 0, color: '#4a5568', fontSize: '14px' }}>
-                Click Run Analysis to have Claude read the latest eval run and summarize strengths,
-                weaknesses, and recommendations for this RAG pipeline.
-              </p>
-            </div>
+
+            {error && (
+              <div
+                style={{
+                  marginTop: '6px',
+                  padding: '8px 10px',
+                  borderRadius: '6px',
+                  backgroundColor: '#fed7d7',
+                  color: '#c53030',
+                  fontSize: '12px',
+                }}
+              >
+                {error}
+              </div>
+            )}
+
+            {loading && !error && (
+              <div
+                style={{
+                  marginTop: '6px',
+                  fontSize: '12px',
+                  color: '#718096',
+                }}
+              >
+                Analyzing the latest eval run. This uses Claude to read all judge scores and
+                explanations.
+              </div>
+            )}
+          </div>
+
+          {/* Analysis output */}
+          {analysis && (
+            <>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  gap: '16px',
+                  marginBottom: '18px',
+                }}
+              >
+                {/* Strengths */}
+                <div
+                  style={{
+                    padding: '12px 14px',
+                    backgroundColor: 'white',
+                    borderRadius: '8px',
+                    border: '1px solid #e2e8f0',
+                  }}
+                >
+                  <h3
+                    style={{
+                      margin: '0 0 6px',
+                      fontSize: '15px',
+                      color: '#2d3748',
+                    }}
+                  >
+                    Strengths
+                  </h3>
+                  {Array.isArray(analysis.strengths) && analysis.strengths.length > 0 ? (
+                    <ul
+                      style={{
+                        margin: 0,
+                        paddingLeft: '18px',
+                        fontSize: '13px',
+                        color: '#4a5568',
+                      }}
+                    >
+                      {analysis.strengths.map((item, idx) => (
+                        <li key={idx}>{item}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: '13px', color: '#718096' }}>
+                      No strengths were identified in this analysis.
+                    </p>
+                  )}
+                </div>
+
+                {/* Weaknesses */}
+                <div
+                  style={{
+                    padding: '12px 14px',
+                    backgroundColor: 'white',
+                    borderRadius: '8px',
+                    border: '1px solid #e2e8f0',
+                  }}
+                >
+                  <h3
+                    style={{
+                      margin: '0 0 6px',
+                      fontSize: '15px',
+                      color: '#2d3748',
+                    }}
+                  >
+                    Weaknesses
+                  </h3>
+                  {Array.isArray(analysis.weaknesses) && analysis.weaknesses.length > 0 ? (
+                    <ul
+                      style={{
+                        margin: 0,
+                        paddingLeft: '18px',
+                        fontSize: '13px',
+                        color: '#4a5568',
+                      }}
+                    >
+                      {analysis.weaknesses.map((item, idx) => (
+                        <li key={idx}>{item}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: '13px', color: '#718096' }}>
+                      No weaknesses were captured in this analysis.
+                    </p>
+                  )}
+                </div>
+
+                {/* Documentation gaps */}
+                <div
+                  style={{
+                    padding: '12px 14px',
+                    backgroundColor: 'white',
+                    borderRadius: '8px',
+                    border: '1px solid #e2e8f0',
+                  }}
+                >
+                  <h3
+                    style={{
+                      margin: '0 0 6px',
+                      fontSize: '15px',
+                      color: '#2d3748',
+                    }}
+                  >
+                    Documentation gaps
+                  </h3>
+                  {Array.isArray(analysis.documentation_gaps) &&
+                  analysis.documentation_gaps.length > 0 ? (
+                    <ul
+                      style={{
+                        margin: 0,
+                        paddingLeft: '18px',
+                        fontSize: '13px',
+                        color: '#4a5568',
+                      }}
+                    >
+                      {analysis.documentation_gaps.map((item, idx) => (
+                        <li key={idx}>{item}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: '13px', color: '#718096' }}>
+                      No documentation gaps were flagged.
+                    </p>
+                  )}
+                </div>
+
+                {/* Recommendations */}
+                <div
+                  style={{
+                    padding: '12px 14px',
+                    backgroundColor: 'white',
+                    borderRadius: '8px',
+                    border: '1px solid #e2e8f0',
+                  }}
+                >
+                  <h3
+                    style={{
+                      margin: '0 0 6px',
+                      fontSize: '15px',
+                      color: '#2d3748',
+                    }}
+                  >
+                    Recommendations
+                  </h3>
+                  {Array.isArray(analysis.recommendations) &&
+                  analysis.recommendations.length > 0 ? (
+                    <ul
+                      style={{
+                        margin: 0,
+                        paddingLeft: '18px',
+                        fontSize: '13px',
+                        color: '#4a5568',
+                      }}
+                    >
+                      {analysis.recommendations.map((item, idx) => (
+                        <li key={idx}>{item}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: '13px', color: '#718096' }}>
+                      No recommendations were returned. Try running the analysis again after more
+                      eval runs.
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* Claude reasoning */}
+              <div
+                style={{
+                  padding: '12px 14px',
+                  backgroundColor: 'white',
+                  borderRadius: '8px',
+                  border: '1px solid #e2e8f0',
+                  fontSize: '13px',
+                  color: '#4a5568',
+                }}
+              >
+                <h3
+                  style={{
+                    margin: '0 0 6px',
+                    fontSize: '15px',
+                    color: '#2d3748',
+                  }}
+                >
+                  Claude reasoning
+                </h3>
+                <p style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
+                  {analysis.claude_reasoning || 'No reasoning text was returned from the agent.'}
+                </p>
+              </div>
+            </>
           )}
         </div>
       )}
 
       {activeTab === 'autoTune' && (
-        <div>
-          {/* Auto Tune button */}
-          <div
+        <div
+          style={{
+            padding: '20px',
+            backgroundColor: '#f7fafc',
+            borderRadius: '12px',
+            border: '1px solid #e2e8f0',
+            marginBottom: '30px',
+          }}
+        >
+          <h2
             style={{
-              display: 'flex',
-              justifyContent: 'center',
-              marginBottom: '24px',
+              marginTop: 0,
+              marginBottom: '10px',
+              fontSize: '20px',
+              color: '#2d3748',
             }}
           >
-            <button
-              onClick={runAutoTune}
-              disabled={autoTuneRunning}
+            Auto Tune Explorer
+          </h2>
+          <p style={{ margin: '0 0 14px', color: '#4a5568', fontSize: '14px' }}>
+            This tab runs an agent driven loop that evaluates the current RAG pipeline,
+            generates new configurations, and keeps the best performer. It is a guided way
+            to see how automated RAG tuning might work in production.
+          </p>
+
+          {/* Explainer card */}
+          <div
+            style={{
+              marginBottom: '16px',
+              padding: '12px 14px',
+              backgroundColor: 'white',
+              borderRadius: '8px',
+              border: '1px solid #e2e8f0',
+              fontSize: '13px',
+              color: '#4a5568',
+            }}
+          >
+            <strong
               style={{
-                padding: '12px 24px',
-                fontSize: '16px',
-                backgroundColor: '#f093fb',
-                color: 'white',
-                border: 'none',
-                borderRadius: '8px',
-                cursor: autoTuneRunning ? 'not-allowed' : 'pointer',
+                color: '#2d3748',
+                display: 'block',
+                marginBottom: '6px',
               }}
             >
-              {autoTuneRunning ? '⚡ Auto-Tuning...' : '⚡ Run Auto-Tune'}
-            </button>
+              What the auto tuner does
+            </strong>
+            <ol style={{ margin: 0, paddingLeft: '18px' }}>
+              <li>Picks a baseline config from the existing eval runs.</li>
+              <li>Runs a full evaluation on the shared eval set.</li>
+              <li>Uses an analysis agent to read scores and explanations.</li>
+              <li>Generates new pipeline configs based on the weaknesses it finds.</li>
+              <li>Evaluates those new configs and compares them to the baseline.</li>
+              <li>Keeps the best config and repeats for a small number of iterations.</li>
+            </ol>
           </div>
 
-          {/* Auto Tune Status */}
-          {(autoTuneRunning || autoTuneStatus || autoTuneResult) && (
+          {/* Controls and status */}
+          <div
+            style={{
+              marginBottom: '18px',
+              padding: '12px 14px',
+              backgroundColor: 'white',
+              borderRadius: '8px',
+              border: '1px solid #e2e8f0',
+              fontSize: '13px',
+              color: '#4a5568',
+            }}
+          >
             <div
               style={{
-                padding: '20px',
-                backgroundColor: '#ebf8ff',
-                borderRadius: '8px',
-                marginBottom: '20px',
-                border: '1px solid #bee3f8',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'flex-start',
+                gap: '12px',
+                marginBottom: '8px',
               }}
             >
-              <h3
+              <div style={{ flex: 1 }}>
+                <strong
+                  style={{
+                    color: '#2d3748',
+                    display: 'block',
+                    marginBottom: '4px',
+                  }}
+                >
+                  Run an auto tuning loop
+                </strong>
+                <p style={{ margin: 0 }}>
+                  Currently this uses the demo workspace and shared eval set, and runs a fixed
+                  number of iterations behind the scenes. The goal here is to observe the
+                  behavior of the loop, not to expose every knob yet.
+                </p>
+              </div>
+              <div>
+                <button
+                  type="button"
+                  onClick={runAutoTune}
+                  disabled={autoTuneRunning}
+                  style={{
+                    padding: '8px 14px',
+                    fontSize: '13px',
+                    borderRadius: '8px',
+                    border: '1px solid #667eea',
+                    backgroundColor: autoTuneRunning ? '#e2e8f0' : '#667eea',
+                    color: autoTuneRunning ? '#4a5568' : 'white',
+                    cursor: autoTuneRunning ? 'not-allowed' : 'pointer',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {autoTuneRunning ? 'Running auto tune…' : 'Run auto tune search'}
+                </button>
+              </div>
+            </div>
+
+            {error && (
+              <div
                 style={{
-                  marginTop: 0,
-                  marginBottom: '8px',
-                  color: '#2b6cb0',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                  fontSize: '16px',
+                  marginTop: '6px',
+                  padding: '8px 10px',
+                  borderRadius: '6px',
+                  backgroundColor: '#fed7d7',
+                  color: '#c53030',
+                  fontSize: '12px',
                 }}
               >
-                {autoTuneRunning ? '⚡ Auto Tune in Progress' : '⚡ Auto Tune Status'}
-              </h3>
-              <p style={{ margin: 0, color: '#2a4365', fontSize: '14px' }}>
-                {autoTuneStatus ||
-                  'Click Run Auto Tune to start the optimization loop. This will run multiple evals and may take a little while.'}
-              </p>
+                {error}
+              </div>
+            )}
 
-              {autoTuneRunning && (
-                <p style={{ margin: '8px 0 0', color: '#2a4365', fontSize: '13px' }}>
-                  The backend is running evaluations, calling LLMs, and generating new configs. The
-                  button will re enable when it finishes.
-                </p>
-              )}
+            {autoTuneStatus && (
+              <div
+                style={{
+                  marginTop: '6px',
+                  padding: '8px 10px',
+                  borderRadius: '6px',
+                  backgroundColor: '#edf2f7',
+                  color: '#4a5568',
+                  fontSize: '12px',
+                }}
+              >
+                {autoTuneStatus}
+              </div>
+            )}
+          </div>
 
-              {autoTuneResult && (
-                <div style={{ marginTop: '12px' }}>
-                  <div
-                    style={{
-                      fontSize: '13px',
-                      color: '#2a4365',
-                      marginBottom: '8px',
-                    }}
-                  >
-                    <strong>Summary:</strong>{' '}
-                    Started at{' '}
-                    {typeof autoTuneResult.starting_score === 'number'
-                      ? autoTuneResult.starting_score.toFixed(2)
-                      : 'N/A'}
-                    , finished at{' '}
+          {/* Results viewer */}
+          {autoTuneResult && (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'minmax(0, 1.3fr) minmax(0, 1.7fr)',
+                gap: '16px',
+              }}
+            >
+              {/* Summary card */}
+              <div
+                style={{
+                  backgroundColor: 'white',
+                  borderRadius: '8px',
+                  border: '1px solid #e2e8f0',
+                  padding: '12px 14px',
+                  fontSize: '13px',
+                  color: '#4a5568',
+                }}
+              >
+                <h3
+                  style={{
+                    marginTop: 0,
+                    marginBottom: '8px',
+                    fontSize: '15px',
+                    color: '#2d3748',
+                  }}
+                >
+                  Run summary
+                </h3>
+                <p style={{ margin: '0 0 6px' }}>
+                  Final score:{' '}
+                  <strong>
                     {typeof autoTuneResult.final_score === 'number'
                       ? autoTuneResult.final_score.toFixed(2)
-                      : 'N/A'}{' '}
-                    with {autoTuneResult.total_iterations ?? 0} iteration
-                    {(autoTuneResult.total_iterations ?? 0) === 1 ? '' : 's'}.
-                  </div>
+                      : 'N/A'}
+                  </strong>
+                </p>
+                <p style={{ margin: '0 0 6px' }}>
+                  Total iterations:{' '}
+                  <strong>{autoTuneResult.total_iterations ?? 'N/A'}</strong>
+                </p>
+                {autoTuneResult.best_config_name && (
+                  <p style={{ margin: '0 0 6px' }}>
+                    Best config:{' '}
+                    <strong>{autoTuneResult.best_config_name}</strong>
+                  </p>
+                )}
+                {autoTuneResult.starting_score != null && (
+                  <p style={{ margin: '0 0 6px' }}>
+                    Starting score:{' '}
+                    <strong>
+                      {typeof autoTuneResult.starting_score === 'number'
+                        ? autoTuneResult.starting_score.toFixed(2)
+                        : autoTuneResult.starting_score}
+                    </strong>
+                  </p>
+                )}
+                {autoTuneResult.improvement != null && (
+                  <p style={{ margin: 0 }}>
+                    Improvement:{' '}
+                    <strong>
+                      {typeof autoTuneResult.improvement === 'number'
+                        ? autoTuneResult.improvement.toFixed(2)
+                        : autoTuneResult.improvement}
+                    </strong>
+                  </p>
+                )}
+              </div>
 
-                  {Array.isArray(autoTuneResult.iteration_history) &&
-                    autoTuneResult.iteration_history.length > 0 && (
-                      <div
+              {/* Iteration details / raw payload */}
+              <div
+                style={{
+                  backgroundColor: 'white',
+                  borderRadius: '8px',
+                  border: '1px solid #e2e8f0',
+                  padding: '12px 14px',
+                  fontSize: '12px',
+                  color: '#4a5568',
+                  maxHeight: '360px',
+                  overflowY: 'auto',
+                }}
+              >
+                <h3
+                  style={{
+                    marginTop: 0,
+                    marginBottom: '8px',
+                    fontSize: '15px',
+                    color: '#2d3748',
+                  }}
+                >
+                  Iterations and raw output
+                </h3>
+
+                {Array.isArray(autoTuneResult.iterations) &&
+                autoTuneResult.iterations.length > 0 ? (
+                  <ul
+                    style={{
+                      listStyle: 'none',
+                      margin: 0,
+                      padding: 0,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '8px',
+                    }}
+                  >
+                    {autoTuneResult.iterations.map((it, idx) => (
+                      <li
+                        key={idx}
                         style={{
-                          marginTop: '8px',
-                          paddingTop: '8px',
-                          borderTop: '1px solid #bee3f8',
+                          padding: '8px 10px',
+                          borderRadius: '6px',
+                          backgroundColor: '#f7fafc',
+                          border: '1px solid #e2e8f0',
                         }}
                       >
                         <div
                           style={{
-                            fontSize: '13px',
-                            color: '#2a4365',
+                            display: 'flex',
+                            justifyContent: 'space-between',
                             marginBottom: '4px',
                           }}
                         >
-                          <strong>Iteration history</strong>
+                          <span
+                            style={{
+                              fontSize: '13px',
+                              color: '#2d3748',
+                              fontWeight: 600,
+                            }}
+                          >
+                            Iteration {it.iteration ?? idx + 1}
+                          </span>
+                          <span style={{ fontSize: '12px', color: '#4a5568' }}>
+                            Score:{' '}
+                            {typeof it.score === 'number'
+                              ? it.score.toFixed(2)
+                              : it.score ?? 'N/A'}
+                          </span>
                         </div>
-                        <ul
-                          style={{
-                            margin: 0,
-                            paddingLeft: '20px',
-                            fontSize: '13px',
-                            color: '#2a4365',
-                          }}
-                        >
-                          {autoTuneResult.iteration_history.map((it) => (
-                            <li key={it.iteration} style={{ marginBottom: '4px' }}>
-                              Iteration {it.iteration}: {it.config_name}, score{' '}
-                              {typeof it.score === 'number'
-                                ? it.score.toFixed(2)
-                                : 'N/A'}{' '}
-                              ({it.improvement_from_previous >= 0 ? '+' : ''}
-                              {typeof it.improvement_from_previous === 'number'
-                                ? it.improvement_from_previous.toFixed(2)
-                                : '0.00'}
-                              )
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-
-                  {autoTuneResult.reason_stopped && (
-                    <div
-                      style={{
-                        marginTop: '8px',
-                        fontSize: '12px',
-                        color: '#4a5568',
-                      }}
-                    >
-                      <strong>Stop reason:</strong> {autoTuneResult.reason_stopped}
-                    </div>
-                  )}
-                </div>
-              )}
+                        {it.config_name && (
+                          <div
+                            style={{
+                              fontSize: '12px',
+                              color: '#718096',
+                              marginBottom: '2px',
+                            }}
+                          >
+                            Config: {it.config_name}
+                          </div>
+                        )}
+                        {it.reason && (
+                          <div
+                            style={{
+                              fontSize: '12px',
+                              color: '#4a5568',
+                            }}
+                          >
+                            {it.reason}
+                          </div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <pre
+                    style={{
+                      margin: 0,
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {JSON.stringify(autoTuneResult, null, 2)}
+                  </pre>
+                )}
+              </div>
             </div>
           )}
         </div>
