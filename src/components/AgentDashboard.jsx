@@ -19,6 +19,9 @@ function AgentDashboard() {
   const [error, setError] = useState(null);
   const [autoTuneStatus, setAutoTuneStatus] = useState('');
   const [autoTuneResult, setAutoTuneResult] = useState(null);
+  const [autoTuneRuns, setAutoTuneRuns] = useState([]);
+  const [selectedAutoTuneRunIndex, setSelectedAutoTuneRunIndex] = useState(null);
+  const [autoTuneHistoryError, setAutoTuneHistoryError] = useState(null);
   const [activeTab, setActiveTab] = useState('system');
 
   // Eval runs state for Eval tab
@@ -49,8 +52,15 @@ function AgentDashboard() {
     if (activeTab === 'evalViewer') {
       fetchEvalRuns();
     }
-    if (activeTab === 'configs' || activeTab === 'agentAnalysis' || activeTab === 'autoTune') {
+    if (
+      activeTab === 'configs' ||
+      activeTab === 'agentAnalysis' ||
+      activeTab === 'autoTune'
+    ) {
       fetchLatestConfigs();
+    }
+    if (activeTab === 'autoTune') {
+      fetchAutoTuneHistory();
     }
   }, [activeTab]);
 
@@ -65,6 +75,28 @@ function AgentDashboard() {
       }
     } catch (err) {
       console.error('Error fetching configs:', err);
+    }
+  };
+
+  const fetchAutoTuneHistory = async () => {
+    try {
+      setAutoTuneHistoryError(null);
+      const response = await fetch(
+        `${API_URL}/agent/auto-tune/history?workspace_id=${WORKSPACE_ID}&eval_set_id=${EVAL_SET_ID}`
+      );
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Failed to load auto tune history: ${response.status} ${text}`);
+      }
+
+      const data = await response.json();
+      const runs = Array.isArray(data.runs) ? data.runs : [];
+      setAutoTuneRuns(runs);
+      setSelectedAutoTuneRunIndex(runs.length > 0 ? 0 : null);
+    } catch (err) {
+      console.error('Error fetching auto tune history:', err);
+      setAutoTuneHistoryError(err.message || 'Failed to load auto tune history');
     }
   };
 
@@ -106,12 +138,13 @@ function AgentDashboard() {
   const runAutoTune = async () => {
     setAutoTuneRunning(true);
     setError(null);
-    setAutoTuneStatus(
-      'Starting auto tuner. This can take a few minutes while it runs multiple evaluations and generates new configs.'
-    );
     setAutoTuneResult(null);
+    setAutoTuneStatus(
+      'Starting auto tuner. First it will run a fresh eval on the current best config, then ask Claude for new configs and evaluate those configs up to 3 times.'
+    );
 
     try {
+      setAutoTuneHistoryError(null);
       const response = await fetch(`${API_URL}/agent/auto-tune`, {
         method: 'POST',
         headers: {
@@ -125,11 +158,17 @@ function AgentDashboard() {
       });
 
       if (!response.ok) {
-        throw new Error('Auto-tune failed');
+        const text = await response.text();
+        throw new Error(`Auto tune failed: ${response.status} ${text}`);
       }
+
+      setAutoTuneStatus(
+        'Auto tuner is running evals and asking Claude for new configs. This can take a couple of minutes depending on model latency.'
+      );
 
       const data = await response.json();
       setAutoTuneResult(data);
+
       setAutoTuneStatus(
         `Auto tune complete. Final score ${
           typeof data.final_score === 'number' ? data.final_score.toFixed(2) : 'N/A'
@@ -144,11 +183,13 @@ function AgentDashboard() {
         }`
       );
 
-      // Refresh configs
+      // Reload persistent history and configs
+      await fetchAutoTuneHistory();
       await fetchLatestConfigs();
     } catch (err) {
       console.error('Error running auto tune:', err);
-      setError(err.message || 'Auto-tune failed');
+      setError(err.message || 'Auto tune failed');
+      setAutoTuneHistoryError(err.message || 'Auto tune failed');
       setAutoTuneStatus('Auto tune failed. Check the error message above and try again.');
     } finally {
       setAutoTuneRunning(false);
@@ -1778,19 +1819,18 @@ function AgentDashboard() {
           >
             Auto Tune Explorer
           </h2>
-          <p style={{ margin: '0 0 14px', color: '#4a5568', fontSize: '14px' }}>
-            This tab runs an agent driven loop that evaluates the current RAG pipeline,
-            generates new configurations, and keeps the best performer. It is a guided way
-            to see how automated RAG tuning might work in production.
+          <p style={{ margin: '0 0 16px', color: '#4a5568', fontSize: '14px' }}>
+            This tab runs a small autonomous loop that evaluates configs, asks Claude for new ones,
+            and keeps any configuration that improves the score.
           </p>
 
-          {/* Explainer card */}
+          {/* What the auto tuner does */}
           <div
             style={{
-              marginBottom: '16px',
-              padding: '12px 14px',
+              marginBottom: '20px',
+              padding: '14px 16px',
               backgroundColor: 'white',
-              borderRadius: '8px',
+              borderRadius: '10px',
               border: '1px solid #e2e8f0',
               fontSize: '13px',
               color: '#4a5568',
@@ -1806,200 +1846,151 @@ function AgentDashboard() {
               What the auto tuner does
             </strong>
             <ol style={{ margin: 0, paddingLeft: '18px' }}>
-              <li>Picks a baseline config from the existing eval runs.</li>
-              <li>Runs a full evaluation on the shared eval set.</li>
+              <li>Picks the current best scoring config from the leaderboard.</li>
+              <li>Runs a fresh eval on that config to get up to date scores.</li>
               <li>Uses an analysis agent to read scores and explanations.</li>
-              <li>Generates new pipeline configs based on the weaknesses it finds.</li>
+              <li>Asks Claude to generate a few new pipeline configs.</li>
               <li>Evaluates those new configs and compares them to the baseline.</li>
               <li>Keeps the best config and repeats for a small number of iterations.</li>
             </ol>
           </div>
 
-          {/* Controls and status */}
+          {/* Run loop + status */}
           <div
             style={{
-              marginBottom: '18px',
-              padding: '12px 14px',
+              marginBottom: '20px',
+              padding: '14px 16px',
               backgroundColor: 'white',
-              borderRadius: '8px',
+              borderRadius: '10px',
               border: '1px solid #e2e8f0',
-              fontSize: '13px',
-              color: '#4a5568',
+              display: 'flex',
+              alignItems: 'flex-start',
+              justifyContent: 'space-between',
+              gap: '16px',
+            }}
+          >
+            <div style={{ flex: 1 }}>
+              <strong
+                style={{
+                  color: '#2d3748',
+                  display: 'block',
+                  marginBottom: '6px',
+                }}
+              >
+                Run an auto tuning loop
+              </strong>
+              <p style={{ margin: 0, color: '#4a5568', fontSize: '13px' }}>
+                Uses the demo workspace and shared eval set with a fixed number of iterations.
+                The goal is to observe the behavior of the loop rather than expose every knob.
+              </p>
+              {error && (
+                <p
+                  style={{
+                    marginTop: '8px',
+                    fontSize: '12px',
+                    color: '#c53030',
+                  }}
+                >
+                  {error}
+                </p>
+              )}
+              {autoTuneStatus && (
+                <p
+                  style={{
+                    marginTop: '8px',
+                    fontSize: '12px',
+                    color: '#4a5568',
+                  }}
+                >
+                  {autoTuneStatus}
+                </p>
+              )}
+            </div>
+            <div>
+              <button
+                type="button"
+                onClick={runAutoTune}
+                disabled={autoTuneRunning}
+                style={{
+                  padding: '10px 18px',
+                  fontSize: '14px',
+                  backgroundColor: autoTuneRunning ? '#a0aec0' : '#667eea',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '8px',
+                  cursor: autoTuneRunning ? 'not-allowed' : 'pointer',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {autoTuneRunning ? 'Running auto tune…' : 'Run auto tune search'}
+              </button>
+            </div>
+          </div>
+
+          {/* Tuning history */}
+          <div
+            style={{
+              padding: '14px 16px',
+              backgroundColor: 'white',
+              borderRadius: '10px',
+              border: '1px solid #e2e8f0',
             }}
           >
             <div
               style={{
                 display: 'flex',
                 justifyContent: 'space-between',
-                alignItems: 'flex-start',
-                gap: '12px',
-                marginBottom: '8px',
+                marginBottom: '10px',
               }}
             >
-              <div style={{ flex: 1 }}>
-                <strong
-                  style={{
-                    color: '#2d3748',
-                    display: 'block',
-                    marginBottom: '4px',
-                  }}
-                >
-                  Run an auto tuning loop
-                </strong>
-                <p style={{ margin: 0 }}>
-                  Currently this uses the demo workspace and shared eval set, and runs a fixed
-                  number of iterations behind the scenes. The goal here is to observe the
-                  behavior of the loop, not to expose every knob yet.
-                </p>
-              </div>
-              <div>
-                <button
-                  type="button"
-                  onClick={runAutoTune}
-                  disabled={autoTuneRunning}
-                  style={{
-                    padding: '8px 14px',
-                    fontSize: '13px',
-                    borderRadius: '8px',
-                    border: '1px solid #667eea',
-                    backgroundColor: autoTuneRunning ? '#e2e8f0' : '#667eea',
-                    color: autoTuneRunning ? '#4a5568' : 'white',
-                    cursor: autoTuneRunning ? 'not-allowed' : 'pointer',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {autoTuneRunning ? 'Running auto tune…' : 'Run auto tune search'}
-                </button>
-              </div>
+              <h3
+                style={{
+                  margin: 0,
+                  fontSize: '15px',
+                  color: '#2d3748',
+                }}
+              >
+                Auto tune history
+              </h3>
+              {autoTuneRuns.length > 0 && (
+                <span style={{ fontSize: '12px', color: '#718096' }}>
+                  {autoTuneRuns.length} run{autoTuneRuns.length === 1 ? '' : 's'}
+                </span>
+              )}
             </div>
 
-            {error && (
-              <div
+            {autoTuneHistoryError && (
+              <p
                 style={{
-                  marginTop: '6px',
-                  padding: '8px 10px',
-                  borderRadius: '6px',
-                  backgroundColor: '#fed7d7',
+                  marginTop: 0,
+                  marginBottom: '8px',
+                  fontSize: '12px',
                   color: '#c53030',
-                  fontSize: '12px',
                 }}
               >
-                {error}
-              </div>
+                {autoTuneHistoryError}
+              </p>
             )}
 
-            {autoTuneStatus && (
+            {autoTuneRuns.length === 0 ? (
+              <p style={{ margin: 0, fontSize: '13px', color: '#718096' }}>
+                No auto tune runs yet. Start a search above to see how the loop behaves over time.
+              </p>
+            ) : (
               <div
                 style={{
-                  marginTop: '6px',
-                  padding: '8px 10px',
-                  borderRadius: '6px',
-                  backgroundColor: '#edf2f7',
-                  color: '#4a5568',
-                  fontSize: '12px',
+                  display: 'grid',
+                  gridTemplateColumns: '260px 1fr',
+                  gap: '16px',
                 }}
               >
-                {autoTuneStatus}
-              </div>
-            )}
-          </div>
-
-          {/* Results viewer */}
-          {autoTuneResult && (
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'minmax(0, 1.3fr) minmax(0, 1.7fr)',
-                gap: '16px',
-              }}
-            >
-              {/* Summary card */}
-              <div
-                style={{
-                  backgroundColor: 'white',
-                  borderRadius: '8px',
-                  border: '1px solid #e2e8f0',
-                  padding: '12px 14px',
-                  fontSize: '13px',
-                  color: '#4a5568',
-                }}
-              >
-                <h3
+                {/* Left: list of runs */}
+                <div
                   style={{
-                    marginTop: 0,
-                    marginBottom: '8px',
-                    fontSize: '15px',
-                    color: '#2d3748',
+                    borderRight: '1px solid #e2e8f0',
+                    paddingRight: '12px',
                   }}
                 >
-                  Run summary
-                </h3>
-                <p style={{ margin: '0 0 6px' }}>
-                  Final score:{' '}
-                  <strong>
-                    {typeof autoTuneResult.final_score === 'number'
-                      ? autoTuneResult.final_score.toFixed(2)
-                      : 'N/A'}
-                  </strong>
-                </p>
-                <p style={{ margin: '0 0 6px' }}>
-                  Total iterations:{' '}
-                  <strong>{autoTuneResult.total_iterations ?? 'N/A'}</strong>
-                </p>
-                {autoTuneResult.best_config_name && (
-                  <p style={{ margin: '0 0 6px' }}>
-                    Best config:{' '}
-                    <strong>{autoTuneResult.best_config_name}</strong>
-                  </p>
-                )}
-                {autoTuneResult.starting_score != null && (
-                  <p style={{ margin: '0 0 6px' }}>
-                    Starting score:{' '}
-                    <strong>
-                      {typeof autoTuneResult.starting_score === 'number'
-                        ? autoTuneResult.starting_score.toFixed(2)
-                        : autoTuneResult.starting_score}
-                    </strong>
-                  </p>
-                )}
-                {autoTuneResult.improvement != null && (
-                  <p style={{ margin: 0 }}>
-                    Improvement:{' '}
-                    <strong>
-                      {typeof autoTuneResult.improvement === 'number'
-                        ? autoTuneResult.improvement.toFixed(2)
-                        : autoTuneResult.improvement}
-                    </strong>
-                  </p>
-                )}
-              </div>
-
-              {/* Iteration details / raw payload */}
-              <div
-                style={{
-                  backgroundColor: 'white',
-                  borderRadius: '8px',
-                  border: '1px solid #e2e8f0',
-                  padding: '12px 14px',
-                  fontSize: '12px',
-                  color: '#4a5568',
-                  maxHeight: '360px',
-                  overflowY: 'auto',
-                }}
-              >
-                <h3
-                  style={{
-                    marginTop: 0,
-                    marginBottom: '8px',
-                    fontSize: '15px',
-                    color: '#2d3748',
-                  }}
-                >
-                  Iterations and raw output
-                </h3>
-
-                {Array.isArray(autoTuneResult.iterations) &&
-                autoTuneResult.iterations.length > 0 ? (
                   <ul
                     style={{
                       listStyle: 'none',
@@ -2010,79 +2001,249 @@ function AgentDashboard() {
                       gap: '8px',
                     }}
                   >
-                    {autoTuneResult.iterations.map((it, idx) => (
-                      <li
-                        key={idx}
-                        style={{
-                          padding: '8px 10px',
-                          borderRadius: '6px',
-                          backgroundColor: '#f7fafc',
-                          border: '1px solid #e2e8f0',
-                        }}
-                      >
-                        <div
+                    {autoTuneRuns.map((run, idx) => (
+                      <li key={run.id || idx}>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedAutoTuneRunIndex(idx)}
                           style={{
-                            display: 'flex',
-                            justifyContent: 'space-between',
-                            marginBottom: '4px',
+                            width: '100%',
+                            textAlign: 'left',
+                            padding: '8px 10px',
+                            borderRadius: '6px',
+                            border:
+                              selectedAutoTuneRunIndex === idx
+                                ? '2px solid #667eea'
+                                : '1px solid #e2e8f0',
+                            backgroundColor:
+                              selectedAutoTuneRunIndex === idx ? '#ebf4ff' : '#f7fafc',
+                            cursor: 'pointer',
+                            fontSize: '13px',
                           }}
                         >
-                          <span
-                            style={{
-                              fontSize: '13px',
-                              color: '#2d3748',
-                              fontWeight: 600,
-                            }}
-                          >
-                            Iteration {it.iteration ?? idx + 1}
-                          </span>
-                          <span style={{ fontSize: '12px', color: '#4a5568' }}>
-                            Score:{' '}
-                            {typeof it.score === 'number'
-                              ? it.score.toFixed(2)
-                              : it.score ?? 'N/A'}
-                          </span>
-                        </div>
-                        {it.config_name && (
                           <div
                             style={{
-                              fontSize: '12px',
-                              color: '#718096',
-                              marginBottom: '2px',
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              marginBottom: '4px',
                             }}
                           >
-                            Config: {it.config_name}
+                            <span style={{ color: '#2d3748', fontWeight: 600 }}>
+                              Run #{autoTuneRuns.length - idx}
+                            </span>
+                            <span style={{ color: '#667eea', fontWeight: 600 }}>
+                              {run.final_score != null
+                                ? run.final_score.toFixed(2)
+                                : 'N/A'}
+                            </span>
                           </div>
-                        )}
-                        {it.reason && (
+                          <div style={{ color: '#718096', fontSize: '12px' }}>
+                            Iterations: {run.total_iterations ?? 0}
+                            {run.improvement != null && (
+                              <>
+                                {' '}
+                                · Δ{' '}
+                                {run.improvement >= 0 ? '+' : ''}
+                                {run.improvement.toFixed(2)}
+                              </>
+                            )}
+                          </div>
                           <div
                             style={{
-                              fontSize: '12px',
-                              color: '#4a5568',
+                              color: '#A0AEC0',
+                              fontSize: '11px',
+                              marginTop: '2px',
                             }}
                           >
-                            {it.reason}
+                            {run.completedAt &&
+                              new Date(run.completedAt).toLocaleString()}
                           </div>
-                        )}
+                        </button>
                       </li>
                     ))}
                   </ul>
-                ) : (
-                  <pre
-                    style={{
-                      margin: 0,
-                      whiteSpace: 'pre-wrap',
-                      wordBreak: 'break-word',
-                    }}
-                  >
-                    {JSON.stringify(autoTuneResult, null, 2)}
-                  </pre>
-                )}
+                </div>
+
+                {/* Right: details for selected run */}
+                <div>
+                  {selectedAutoTuneRunIndex == null ? (
+                    <p style={{ margin: 0, fontSize: '13px', color: '#718096' }}>
+                      Select a run on the left to see its iterations and configs.
+                    </p>
+                  ) : (
+                    (() => {
+                      const selectedRun = autoTuneRuns[selectedAutoTuneRunIndex];
+                      return (
+                        <div>
+                          <h4
+                            style={{
+                              marginTop: 0,
+                              marginBottom: '8px',
+                              fontSize: '14px',
+                              color: '#2d3748',
+                            }}
+                          >
+                            Run details
+                          </h4>
+                          {selectedRun.history && selectedRun.history.length > 0 ? (
+                            <ul
+                              style={{
+                                listStyle: 'none',
+                                margin: 0,
+                                padding: 0,
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '6px',
+                                fontSize: '13px',
+                              }}
+                            >
+                              {selectedRun.history.map((step) => (
+                                <li
+                                  key={step.iteration}
+                                  style={{
+                                    padding: '8px 10px',
+                                    borderRadius: '6px',
+                                    backgroundColor: '#f7fafc',
+                                    border: '1px solid #e2e8f0',
+                                  }}
+                                >
+                                  <div
+                                    style={{
+                                      display: 'flex',
+                                      justifyContent: 'space-between',
+                                      marginBottom: '4px',
+                                    }}
+                                  >
+                                    <span style={{ color: '#2d3748', fontWeight: 600 }}>
+                                      Iteration {step.iteration}
+                                    </span>
+                                    <span style={{ color: '#667eea', fontWeight: 600 }}>
+                                      {step.avg_overall != null
+                                        ? step.avg_overall.toFixed(2)
+                                        : 'N/A'}
+                                    </span>
+                                  </div>
+                                  <div style={{ color: '#718096', fontSize: '12px' }}>
+                                    Config: {step.pipeline_config_name}
+                                  </div>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p
+                              style={{
+                                margin: 0,
+                                fontSize: '13px',
+                                color: '#718096',
+                              }}
+                            >
+                              This run completed without iteration details.
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })()
+                  )}
+                </div>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       )}
+
+      {autoTuneResult &&
+        Array.isArray(autoTuneResult.history) &&
+        autoTuneResult.history.length > 0 && (
+          <div
+            style={{
+              marginTop: '12px',
+              paddingTop: '10px',
+              borderTop: '1px solid #e2e8f0',
+            }}
+          >
+            <strong
+              style={{
+                display: 'block',
+                marginBottom: '6px',
+                fontSize: '13px',
+                color: '#2d3748',
+              }}
+            >
+              Tuning history
+            </strong>
+            <p style={{ margin: '0 0 6px', fontSize: '12px', color: '#718096' }}>
+              Each row is one iteration of the loop, starting from the baseline config and moving
+              toward the current best config.
+            </p>
+            <div
+              style={{
+                borderRadius: '8px',
+                border: '1px solid #e2e8f0',
+                overflow: 'hidden',
+                backgroundColor: '#f9fafb',
+              }}
+            >
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '60px minmax(0, 1fr) 80px',
+                  padding: '6px 10px',
+                  fontSize: '11px',
+                  fontWeight: 600,
+                  color: '#4a5568',
+                  borderBottom: '1px solid #e2e8f0',
+                  backgroundColor: '#edf2f7',
+                }}
+              >
+                <div>Iter</div>
+                <div>Config name</div>
+                <div style={{ textAlign: 'right' }}>Score</div>
+              </div>
+              {autoTuneResult.history.map((item, idx) => {
+                const isFinal =
+                  autoTuneResult.final_config_id &&
+                  item.pipeline_config_id === autoTuneResult.final_config_id;
+                return (
+                  <div
+                    key={`${item.iteration}-${item.eval_run_id}`}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: '60px minmax(0, 1fr) 80px',
+                      padding: '6px 10px',
+                      fontSize: '12px',
+                      color: '#2d3748',
+                      borderBottom:
+                        idx === autoTuneResult.history.length - 1
+                          ? 'none'
+                          : '1px solid #e2e8f0',
+                      backgroundColor: isFinal ? '#ebf4ff' : 'transparent',
+                    }}
+                  >
+                    <div>#{item.iteration}</div>
+                    <div
+                      style={{
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {item.pipeline_config_name}
+                    </div>
+                    <div style={{ textAlign: 'right' }}>
+                      {typeof item.avg_overall === 'number'
+                        ? item.avg_overall.toFixed(2)
+                        : 'N/A'}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <p style={{ margin: '8px 0 0', fontSize: '12px', color: '#718096' }}>
+              You can inspect these configs in the Config Leaderboard tab and open their runs in
+              Eval Runs and Judge to see question level details.
+            </p>
+          </div>
+        )}
 
       {activeTab === 'configs' && (
         <div style={{ marginTop: '20px' }}>
