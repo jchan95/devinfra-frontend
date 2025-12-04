@@ -39,7 +39,15 @@ function AgentDashboard() {
   const [liveLatency, setLiveLatency] = useState(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState(null);
+
+  // Insights tab state
+  const [insightsRuns, setInsightsRuns] = useState([]);
+  const [insightsLoading, setInsightsLoading] = useState(false);
+  const [insightsError, setInsightsError] = useState(null);
+
   const bestRunForAnalysis = configs.length > 0 ? configs[0] : null;
+  const selectedConfigForAnalysis =
+    configs.find((r) => r.eval_run_id === selectedRunId) || bestRunForAnalysis;
   // Helper: Human readable origin label for eval runs/configs
   const getOriginLabel = (origin) => {
     if (origin === 'agent_suggested') return 'Agent suggested config';
@@ -61,6 +69,9 @@ function AgentDashboard() {
     }
     if (activeTab === 'autoTune') {
       fetchAutoTuneHistory();
+    }
+    if (activeTab === 'insights') {
+      fetchInsightsRuns();
     }
   }, [activeTab]);
 
@@ -100,13 +111,39 @@ function AgentDashboard() {
     }
   };
 
+  const fetchInsightsRuns = async () => {
+    try {
+      setInsightsLoading(true);
+      setInsightsError(null);
+
+      const response = await fetch(
+        `${API_URL}/eval/runs/compare?eval_set_id=${EVAL_SET_ID}`
+      );
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Failed to load insights data: ${response.status} ${text}`);
+      }
+
+      const data = await response.json();
+      const runs = Array.isArray(data.runs) ? data.runs : [];
+      // Sort oldest to newest for the chart
+      runs.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      setInsightsRuns(runs);
+    } catch (err) {
+      console.error('Error fetching insights runs:', err);
+      setInsightsError(err.message || 'Failed to load insights data');
+    } finally {
+      setInsightsLoading(false);
+    }
+  };
+
   const runAnalysis = async () => {
     setLoading(true);
     setError(null);
 
     try {
-        const chosenRun =
-        configs.find((r) => r.eval_run_id === selectedRunId) || configs[0];
+      const chosenRun = selectedConfigForAnalysis;
 
       if (!chosenRun) {
         throw new Error('No eval runs found. Run an evaluation first.');
@@ -364,6 +401,187 @@ function AgentDashboard() {
     }
   };
 
+  // --- INSIGHTS CHART COMPONENTS ---
+  const QualityLineChart = ({ data }) => {
+    if (!data || data.length === 0) {
+      return (
+        <p style={{ margin: 0, fontSize: '13px', color: '#718096' }}>
+          No eval runs found for this eval set yet.
+        </p>
+      );
+    }
+
+    const width = 700;
+    const height = 260;
+    const padding = 40;
+    const maxScore = 5; // scores are 0 to 5
+    const yTicks = [0, 1, 2, 3, 4, 5];
+
+    const metrics = [
+      { key: 'overall', label: 'Overall', color: '#2b6cb0' },
+      { key: 'relevance', label: 'Relevance', color: '#38a169' },
+      { key: 'faithfulness', label: 'Faithfulness', color: '#d69e2e' },
+      { key: 'completeness', label: 'Completeness', color: '#e53e3e' },
+    ];
+
+    const xForIndex = (idx) => {
+      if (data.length === 1) {
+        return padding + (width - 2 * padding) / 2;
+      }
+      const t = idx / (data.length - 1);
+      return padding + t * (width - 2 * padding);
+    };
+
+    const yForScore = (value) => {
+      if (typeof value !== 'number') return height - padding;
+      const clamped = Math.max(0, Math.min(maxScore, value));
+      const t = clamped / maxScore;
+      return height - padding - t * (height - 2 * padding);
+    };
+
+    const buildPath = (key) =>
+      data
+        .map((point, idx) => {
+          const x = xForIndex(idx);
+          const y = yForScore(point[key]);
+          return `${idx === 0 ? 'M' : 'L'}${x},${y}`;
+        })
+        .join(' ');
+
+    // Helper to select at most 6 evenly spaced tick indices for x axis labels
+    const maxTicks = 6;
+    const xLabelIndices = (() => {
+      const n = data.length;
+      if (n === 0) return [];
+      if (n <= maxTicks) {
+        return data.map((_, idx) => idx);
+      }
+      const step = (n - 1) / (maxTicks - 1);
+      const indices = [];
+      for (let i = 0; i < maxTicks; i += 1) {
+        const idx = Math.round(i * step);
+        if (!indices.includes(idx)) {
+          indices.push(idx);
+        }
+      }
+      return indices;
+    })();
+
+    return (
+      <div>
+        <svg width="100%" viewBox={`0 0 ${width} ${height}`}>
+          {/* axes */}
+          <line
+            x1={padding}
+            y1={height - padding}
+            x2={width - padding}
+            y2={height - padding}
+            stroke="#e2e8f0"
+          />
+          <line
+            x1={padding}
+            y1={padding}
+            x2={padding}
+            y2={height - padding}
+            stroke="#e2e8f0"
+          />
+
+          {/* y axis ticks and labels */}
+          {yTicks.map((tick) => {
+            const y = yForScore(tick);
+            return (
+              <g key={tick}>
+                <line
+                  x1={padding - 4}
+                  y1={y}
+                  x2={padding}
+                  y2={y}
+                  stroke="#cbd5e0"
+                />
+                <text
+                  x={padding - 8}
+                  y={y + 3}
+                  fontSize="10"
+                  textAnchor="end"
+                  fill="#718096"
+                >
+                  {tick}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* metric lines */}
+          {metrics.map((metric) => (
+            <path
+              key={metric.key}
+              d={buildPath(metric.key)}
+              fill="none"
+              stroke={metric.color}
+              strokeWidth="2"
+            />
+          ))}
+
+          {/* x axis labels */}
+          {xLabelIndices.map((idx) => {
+            const point = data[idx];
+            const x = xForIndex(idx);
+            return (
+              <text
+                key={idx}
+                x={x}
+                y={height - padding + 14}
+                fontSize="10"
+                textAnchor="middle"
+                fill="#718096"
+              >
+                {point.label}
+              </text>
+            );
+          })}
+        </svg>
+
+        {/* legend */}
+        <div
+          style={{
+            display: 'flex',
+            gap: '12px',
+            fontSize: '12px',
+            marginTop: '8px',
+          }}
+        >
+          {metrics.map((metric) => (
+            <div
+              key={metric.key}
+              style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
+            >
+              <span
+                style={{
+                  width: '12px',
+                  height: '2px',
+                  backgroundColor: metric.color,
+                  display: 'inline-block',
+                }}
+              />
+              <span>{metric.label}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const qualitySeries = insightsRuns.map((run) => {
+    const d = new Date(run.created_at);
+    const shortLabel = `${d.getMonth() + 1}/${d.getDate()}`;
+    return {
+      label: shortLabel,
+      overall: run.avg_overall,
+      relevance: run.avg_relevance,
+      faithfulness: run.avg_faithfulness,
+      completeness: run.avg_completeness,
+    };
+  });
 
 
   return (
@@ -396,11 +614,37 @@ function AgentDashboard() {
           style={{
             textAlign: 'center',
             color: '#718096',
-            marginBottom: '24px',
+            marginBottom: '6px',
             fontSize: '18px',
           }}
         >
-          Autonomous RAG Optimization System
+          Autonomous RAG Optimization System by John Chan
+        </p>
+        <p
+          style={{
+            textAlign: 'center',
+            color: '#4a5568',
+            marginBottom: '24px',
+            fontSize: '14px',
+          }}
+        >
+          <a
+            href="https://www.linkedin.com/in/johnmchan/"
+            target="_blank"
+            rel="noreferrer"
+            style={{ color: '#4a5568', textDecoration: 'underline', marginRight: '8px' }}
+          >
+            LinkedIn
+          </a>
+          <span style={{ margin: '0 4px' }}>•</span>
+          <a
+            href="https://github.com/jchan95/devinfra"
+            target="_blank"
+            rel="noreferrer"
+            style={{ color: '#4a5568', textDecoration: 'underline', marginLeft: '8px' }}
+          >
+            GitHub
+          </a>
         </p>
 
         {/* Static header explainer */}
@@ -1527,20 +1771,20 @@ function AgentDashboard() {
               }}
             >
               <div>
-                <strong style={{ color: '#2d3748', display: 'block', marginBottom: '4px' }}>
+              <strong style={{ color: '#2d3748', display: 'block', marginBottom: '4px' }}>
                   Config being analyzed
                 </strong>
-                {bestRunForAnalysis ? (
+                {selectedConfigForAnalysis ? (
                   <>
                     <div style={{ fontSize: '13px', color: '#2d3748', marginBottom: '2px' }}>
-                      {bestRunForAnalysis.config_name || 'Unnamed config'}
+                      {selectedConfigForAnalysis.config_name || 'Unnamed config'}
                     </div>
                     <div style={{ fontSize: '12px', color: '#718096' }}>
                       Overall score:{' '}
-                      {typeof bestRunForAnalysis.avg_overall === 'number'
-                        ? bestRunForAnalysis.avg_overall.toFixed(2)
+                      {typeof selectedConfigForAnalysis.avg_overall === 'number'
+                        ? selectedConfigForAnalysis.avg_overall.toFixed(2)
                         : 'N/A'}{' '}
-                      · Origin: {getOriginLabel(bestRunForAnalysis.origin)}
+                      · Origin: {getOriginLabel(selectedConfigForAnalysis.origin)}
                     </div>
                   </>
                 ) : (
@@ -1555,17 +1799,17 @@ function AgentDashboard() {
                 <button
                   type="button"
                   onClick={runAnalysis}
-                  disabled={loading || !bestRunForAnalysis}
+                  disabled={loading || !selectedConfigForAnalysis}
                   style={{
                     padding: '8px 12px',
                     fontSize: '13px',
                     borderRadius: '8px',
                     border: '1px solid #667eea',
                     backgroundColor:
-                      loading || !bestRunForAnalysis ? '#e2e8f0' : '#667eea',
-                    color: loading || !bestRunForAnalysis ? '#4a5568' : 'white',
+                      loading || !selectedConfigForAnalysis ? '#e2e8f0' : '#667eea',
+                    color: loading || !selectedConfigForAnalysis ? '#4a5568' : 'white',
                     cursor:
-                      loading || !bestRunForAnalysis ? 'not-allowed' : 'pointer',
+                      loading || !selectedConfigForAnalysis ? 'not-allowed' : 'pointer',
                     whiteSpace: 'nowrap',
                   }}
                 >
@@ -2363,6 +2607,7 @@ function AgentDashboard() {
         </div>
       )}
 
+      {/* INSIGHTS TAB */}
       {activeTab === 'insights' && (
         <div
           style={{
@@ -2383,10 +2628,28 @@ function AgentDashboard() {
           >
             Insights Dashboard
           </h2>
-          <p style={{ margin: 0, color: '#4a5568', fontSize: '14px' }}>
-            Score trend charts and other insights will go here. This tab will visualize how the
-            system improves over iterations and across configurations.
+          <p style={{ margin: '0 0 16px', color: '#4a5568', fontSize: '14px' }}>
+            Track quality metrics across eval runs. This chart shows how overall, relevance, faithfulness, and completeness scores have changed over time for the current eval set.
           </p>
+          <div
+            style={{
+              backgroundColor: 'white',
+              borderRadius: '8px',
+              border: '1px solid #e2e8f0',
+              padding: '18px 22px',
+              minHeight: '300px',
+              maxWidth: '760px',
+              margin: '0 auto 10px',
+            }}
+          >
+            {insightsLoading ? (
+              <p style={{ margin: 0, fontSize: '13px', color: '#718096' }}>Loading chart...</p>
+            ) : insightsError ? (
+              <p style={{ margin: 0, fontSize: '13px', color: '#c53030' }}>{insightsError}</p>
+            ) : (
+              <QualityLineChart data={qualitySeries} />
+            )}
+          </div>
         </div>
       )}
 
